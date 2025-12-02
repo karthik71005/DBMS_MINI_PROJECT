@@ -8,7 +8,8 @@ from app import models
 # Initialize Faker
 fake = Faker()
 
-# Create Tables
+# Create Tables (Reset DB)
+print("Resetting database...")
 models.Base.metadata.drop_all(bind=engine)
 models.Base.metadata.create_all(bind=engine)
 
@@ -62,6 +63,9 @@ def create_audit_logs(db: Session):
     users = db.query(models.User).all()
     actions = ["LOGIN", "CREATE_LOAN", "APPROVE_LOAN", "VIEW_REPORT", "UPDATE_BORROWER"]
     
+    if not users:
+        return
+
     for _ in range(30): # Create 30 random logs
         user = random.choice(users)
         log = models.AuditLog(
@@ -99,14 +103,33 @@ def create_borrowers_and_loans(db: Session):
     db.commit()
 
 def process_loan_logic(db: Session, borrower_id: int, loan_types):
-    # Random Loan Type
+    # 1. Random Loan Type
     loan_type = random.choice(loan_types)
     
-    # Random Loan Parameters based on type
+    # 2. Random Loan Parameters
     principal = round(random.uniform(5000, float(loan_type.max_amount)), 2)
     rate = loan_type.base_interest_rate
-    term = random.choice([12, 24, 36, 48, 60])
+    
+    # 3. Determine Term (Clamp to max tenure)
+    term_options = [12, 24, 36, 48, 60, 120, 180, 240]
+    term = random.choice(term_options)
     if term > loan_type.max_tenure:
+        term = loan_type.max_tenure
+
+    # 4. Determine Dates and Status (FIXED SECTION)
+    created_at = fake.date_time_between(start_date='-2y', end_date='-1M')
+    
+    # Random status
+    status_options = [models.LoanStatus.active, models.LoanStatus.closed, models.LoanStatus.pending, models.LoanStatus.rejected]
+    status = random.choice(status_options)
+
+    disbursed_on = None
+    
+    # Only Active or Closed loans have a disbursement date
+    if status in [models.LoanStatus.active, models.LoanStatus.closed]:
+        # Disbursed 1-10 days after creation
+        disbursed_on = created_at + timedelta(days=random.randint(1, 10))
+    
     # Create Loan Object
     loan = models.Loan(
         borrower_id=borrower_id,
@@ -133,7 +156,7 @@ def process_loan_logic(db: Session, borrower_id: int, loan_types):
         )
         db.add(collateral)
 
-    # Generate Repayments and Ledger if the loan was disbursed
+    # Generate Repayments and Ledger ONLY if the loan was disbursed
     if disbursed_on:
         # Ledger: Disbursement
         ledger_disb = models.Ledger(
@@ -155,7 +178,7 @@ def generate_repayments(db: Session, loan: models.Loan):
     
     # Track how much is paid to update 'outstanding'
     total_paid = 0
-    current_balance = float(loan.principal) # For ledger tracking (simplified)
+    current_balance = float(loan.principal) # For ledger tracking
 
     for i in range(1, loan.term_months + 1):
         due_date = loan.disbursed_on + timedelta(days=30 * i)
@@ -171,19 +194,27 @@ def generate_repayments(db: Session, loan: models.Loan):
         
         is_past_due = due_date < now
         
+        should_pay = False
+
         if loan.status == models.LoanStatus.closed:
-            repayment_status = "paid"
-            paid_amount = monthly_installment
-            paid_on = due_date # Paid on time
+            should_pay = True
         elif loan.status == models.LoanStatus.active and is_past_due:
-            # Random chance to be paid or overdue
+            # Random chance to be paid vs overdue
             if random.random() < 0.9: # 90% chance paid
-                repayment_status = "paid"
-                paid_amount = monthly_installment
-                paid_on = due_date + timedelta(days=random.randint(-2, 5))
+                should_pay = True
             else:
                 repayment_status = "overdue"
         
+        if should_pay:
+            repayment_status = "paid"
+            paid_amount = monthly_installment
+            # Paid randomly around due date
+            paid_on = due_date + timedelta(days=random.randint(-2, 5))
+            
+            # Ensure paid_on is not in the future
+            if paid_on > now:
+                paid_on = now
+
         # Create Repayment
         repayment = models.Repayment(
             loan_id=loan.id,
@@ -231,6 +262,9 @@ def populate():
     except Exception as e:
         print(f"Error: {e}")
         db.rollback()
+        # Optional: Print traceback for debugging
+        import traceback
+        traceback.print_exc()
     finally:
         db.close()
 
